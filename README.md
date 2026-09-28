@@ -1,0 +1,218 @@
+# agent-reliability
+
+**Independently verify that your AI agent's tool calls actually did what they claim — by checking real system state, not by trusting the tool's own self-report.**
+
+An agent that says *"done"* has told you its execution stopped, not that the work happened. A write can silently no-op, a mutation can match zero rows, an API can return `200` with an error body — and every one of those looks identical to a real success in a trace or a chat transcript. `agent-reliability` closes that gap for one specific, well-scoped problem: **false success reporting**.
+
+---
+
+## Why this exists
+
+- **LLMs report success with the same confident tone whether they're right or wrong.** There's no cost to being wrong, and no visible difference in the output.
+- **Observability traces, evals, and guardrails don't catch this.** Traces show the agent narrating its own steps — if a write silently no-ops, the trace stays green. Evals grade whether output *reads* correctly. Guardrails run *before* the action, not after.
+- **The fix is almost embarrassingly simple in principle:** never let a self-reported success flag be the only signal. Re-check the real system, deterministically, after every call.
+
+This library does exactly that, and only that. It is not an agent framework, not an observability platform, and not a policy/guardrail layer. It wraps your tool functions and tells you, per call, whether the claimed side effect is independently confirmed.
+
+---
+
+## How it works
+
+```
+ agent calls tool
+        │
+        ▼
+ [1] snapshot real state (before)
+        │
+        ▼
+ [2] run the actual tool  ──▶ tool's own claim (return value / exception)
+        │
+        ▼
+ [3] snapshot real state (after)
+        │
+        ▼
+ [4] verifier compares claim vs. real state  ──▶  Verdict (deterministic, no LLM)
+```
+
+- **The SDK wraps your tools, not your agent.** One `@verify_action("tool_name")` decorator per tool function. Your agent's code and LLM calls are untouched. A tool you don't wrap is simply not checked.
+- **Verdicts are deterministic.** No LLM ever decides pass/fail — that would just move the exact same trust problem up one level, while adding cost, latency, and non-repeatability. All reasoning text is built from real facts a verifier actually checked.
+- **Verifiers check side effects, not output text.** A tool call's outcome usually falls into a small, closed set: a database changed, a file was written, an HTTP call happened, a record was created. You don't need a verifier per possible thing an agent might *say* — you need one per possible thing it might *do*.
+- **Verifiers never re-execute a mutation.** SQL checks use a read-only connection; before/after state is compared, never re-run. A non-mutating call (like an HTTP `GET`) *can* be safely re-observed, since there's no side effect to duplicate.
+
+---
+
+## Installation
+
+```bash
+pip install -e .
+```
+
+The core package (`agent_reliability`) has **zero third-party dependencies** — it only uses the Python standard library. To run the bundled examples (which wrap real LangChain tools) or the dev/test suite:
+
+```bash
+pip install -e ".[dev]"
+```
+
+Requires Python 3.9+.
+
+---
+
+## Quickstart
+
+```python
+from agent_reliability import verify_action, registry, verify_sql_mutation, snapshot_sql_state
+
+# 1. Tell the registry which verifier checks which tool
+registry.register("run_sql", verify_sql_mutation, snapshot=snapshot_sql_state)
+
+# 2. Decorate the tool. Your function's logic doesn't change.
+@verify_action("run_sql")
+def run_sql(query: str, db_path: str):
+    ...  # your existing implementation
+
+# 3. Call it like normal
+result = run_sql(query="UPDATE customers SET email='new@x.com' WHERE id=1", db_path="app.db")
+
+print(result["tool_result"])                       # whatever your tool returned
+print(result["verification"]["verified"])           # True / False — is it actually true?
+print(result["verification"]["failure_type"])        # "none", "false_success", ...
+print(result["verification"]["reasoning"])            # human-readable explanation
+```
+
+If the tool claimed success but the `WHERE` clause matched nothing, `verified` is `False` and `failure_type` is `"false_success"` — even though the tool itself said `"SUCCESS"`.
+
+---
+
+## The `Verdict`
+
+Every verified call returns a `Verdict`:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `verified` | `bool` | Did independent verification confirm the claim? |
+| `basis` | `str` | `"receipt-confirmed"` (real state checked) · `"self-report-only"` (couldn't independently confirm) · `"no-check-possible"` |
+| `confidence` | `str` | `"high"` · `"low"` · `"unknown"` |
+| `reasoning` | `str` | Fixed-template explanation built from real facts, not LLM-generated |
+| `failure_type` | `str` | See table below |
+| `execution_time_ms` | `float` | Wall-clock time for the tool call |
+| `call_id` | `str` | Unique ID for this call, usable with `get_verdict()` |
+
+### `FailureType` values
+
+| Value | Meaning |
+|---|---|
+| `none` | No failure — claim verified |
+| `false_success` | Tool reported success; real state says nothing happened |
+| `self_report_mismatch` | Tool's claimed count/value doesn't match observed reality |
+| `partial_success` | Some, but not all, of the targeted state actually changed |
+| `no_op` | State unchanged, but too complex to confirm whether that's expected |
+| `crash` | Tool raised an exception |
+| `schema_error` | Referenced a table/column that doesn't exist |
+| `no_verifier` | No verifier is registered for this tool name |
+| `verifier_error` | The verifier itself failed to run |
+| `missing_input` | Verifier didn't have what it needed to check anything |
+| `bad_output` | Tool's output was malformed or the wrong shape |
+| `http_error` | HTTP call returned a non-success status code |
+
+---
+
+## Built-in verifiers
+
+Six verifiers cover the common side effects an agent tool produces:
+
+| Verifier | Checks | Needs a snapshot? |
+|---|---|---|
+| `verify_sql_mutation` | Real before/after DB state vs. the tool's claimed row count. Detects false successes, partial updates, idempotent no-ops, and self-report mismatches. Read-only, WHERE-bounded — never scans or copies more of the table than the statement itself targets. | Yes — `snapshot_sql_state` |
+| `verify_sql_schema` | Whether every table referenced in a query actually exists. | No |
+| `verify_file_written` | Fingerprints (size + mtime + sha256) the target file before and after. Catches "never created," "0 bytes," and a tool that claims success but leaves an existing file byte-for-byte untouched. | Optional — `snapshot_file_state` (needed for the "already existed and untouched" check) |
+| `verify_json_payload` | Required keys are present in a dict or JSON-parseable string output. | No |
+| `verify_http_status` | Status code is in the expected set **and** the body doesn't carry an application-level error (`ok: false`, `success: false`, `error`/`errors` fields). A `200` with an error body is not treated as success. | No |
+| `verify_regex_match` | Output matches a required pattern. Full-match by default (`match_mode="full"`), or `"search"` for a substring match. | No |
+
+Each is a pure function: `(args, kwargs, tool_output[, pre_state]) -> Verdict`. They know nothing about the registry or the decorator, so you can call and test them directly.
+
+---
+
+## Adapting a tool you don't control
+
+Real tools rarely use your exact kwarg names or return shape. Two features remove the need to hand-write an adapter for the common case:
+
+**1. Rename fields at registration time**, instead of writing a wrapper function:
+
+```python
+registry.register(
+    "their_sql_tool",
+    verify_sql_mutation,
+    snapshot=snapshot_sql_state,
+    field_map={"query": "sql_text", "db_path": "database_file"},          # our_name -> their_name
+    output_field_map={"rows_affected_by_tool": "affected"},                # applies to dict return values
+)
+```
+
+The tool is still called with its own original kwargs and returns its own original shape — only the copy handed to the verifier is translated.
+
+**2. Keep the tool's return value completely untouched** with `wrap=False`:
+
+```python
+@verify_action("their_sql_tool", wrap=False, on_verdict=lambda v: log.info(v))
+def their_sql_tool(sql_text: str, database_file: str):
+    ...
+    return {"outcome": "done", "affected": 3}   # returned exactly as-is to every caller
+```
+
+The verdict is delivered via the `on_verdict` callback, `get_verdict(call_id)` / `get_last_verdict()`, and — if the output is a dict — a non-destructive `"__verification__"` key added to a copy.
+
+A tool with a genuinely custom output shape (nested objects, a class instance, a list) will still need a small real adapter. See `examples/langchain_integration.py`, `examples/real_file_integration.py`, and `examples/real_http_integration.py` for worked examples against real (not mocked) tools, including the friction each one produced in practice.
+
+---
+
+## Repository layout
+
+```
+src/agent_reliability/     the installable package
+    verdict.py                  Verdict, FailureType
+    verify_agent.py             VerifierRegistry, @verify_action engine
+    universal_verifiers.py      the six built-in verifiers + snapshot functions
+tests/                     regression harnesses (mocked tools; no external calls)
+    test_harness.py             40 scenarios across all 6 verifiers
+    adversarial_harness.py      9 scenarios: async, swallowed errors, isError, partial success
+    metrics.py                  detection rate / false-alarm rate, independent of PASS/FAIL
+    mock_agent_harness.py       controllable fake tools used by the harnesses above
+examples/                  integrations against real, unmodified third-party tools
+    langchain_integration.py        real LangChain SQL tool
+    real_file_integration.py        real LangChain file-write tool
+    real_http_integration.py        real LangChain HTTP tool, real local server
+    custom_tool_adapter_demo.py     field_map / wrap=False against an unrelated tool shape
+```
+
+Run the suite:
+
+```bash
+python tests/test_harness.py -v
+python tests/adversarial_harness.py
+python tests/metrics.py
+```
+
+---
+
+## Design boundaries (what this deliberately does *not* do)
+
+- **Doesn't judge the agent's reasoning, chat messages, or final summary** — only what its wrapped tools actually did. Verifying a final summary against the sequence of verified tool results is a natural future extension, not part of V1.
+- **Doesn't use an LLM to decide a verdict.** An LLM proposing a check for a tool with no existing verifier is a possible future mode — it would never issue the verdict itself, only suggest what to check.
+- **Doesn't retry, roll back, or auto-remediate.** A `false_success` verdict is information; what you do with it is up to you.
+- **Doesn't reconcile against a provider's own audit log**, or maintain a durable intent/correlation-ID log across process restarts. This is a real and separate problem (catching a side effect that landed at a provider when your own receipt-write never happened) — it's a meaningfully larger subsystem than call-level verification and is intentionally out of scope for now.
+
+## Known limitations
+
+- A typo'd table name and a genuinely hallucinated table name are indistinguishable at the SQLite level — both surface as `schema_error`.
+- The SQL post-condition parser only understands simple `SET col = 'text' | number | NULL` clauses; anything more complex when state is unchanged falls back to the lower-confidence `no_op` verdict rather than guessing.
+- File fingerprinting hashes files up to 10MB; larger files fall back to size + mtime only.
+- Verifiers assume a single-process, non-concurrent caller between snapshot and check — a concurrent write to the same row between the two reads isn't accounted for.
+
+## Status
+
+This is a V1 focused on one sub-problem: false success reporting on individually wrapped tool calls. It is not a full agent platform. Early and looking for feedback. Open an issue with a tool call it misses or gets wrong.
+
+## License
+
+Free for personal use and for evaluation/testing (including at companies). 
