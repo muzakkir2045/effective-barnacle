@@ -3,7 +3,7 @@
 **Independently verify that your AI agent's tool calls actually did what they claim — by checking real system state, not by trusting the tool's own self-report.**
 
 An agent that says *"done"* has told you its execution stopped, not that the work happened. A write can silently no-op, a mutation can match zero rows, an API can return `200` with an error body — and every one of those looks identical to a real success in a trace or a chat transcript. `agent-reliability` closes that gap for one specific, well-scoped problem: **false success reporting**.
-
+> LangChain's SQL tool returns `''` for both a successful UPDATE and one that matched zero rows. This library catches that by diffing real state before and after.
 ---
 
 ## Why this exists
@@ -44,14 +44,10 @@ This library does exactly that, and only that. It is not an agent framework, not
 ## Installation
 
 ```bash
-pip install -e .
+pip install git+https://github.com/muzakkir2045/effective-barnacle
 ```
 
-The core package (`agent_reliability`) has **zero third-party dependencies** — it only uses the Python standard library. To run the bundled examples (which wrap real LangChain tools) or the dev/test suite:
-
-```bash
-pip install -e ".[dev]"
-```
+Or from a local clone: `pip install -e .`
 
 Requires Python 3.9+.
 
