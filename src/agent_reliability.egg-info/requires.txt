@@ -1,0 +1,10 @@
+
+[dev]
+langchain
+langchain-community
+requests
+
+[examples]
+langchain
+langchain-community
+requests

@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-reliability"
+version = "0.1.0"
+description = "Independently verify AI agent tool calls against real system state, instead of trusting the tool's self-report."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []          # core package is stdlib-only, no third-party dependencies
+
+[project.optional-dependencies]
+examples = ["langchain", "langchain-community", "requests"]
+dev = ["langchain", "langchain-community", "requests"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
