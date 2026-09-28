@@ -9,6 +9,7 @@ description = "Independently verify AI agent tool calls against real system stat
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = []          # core package is stdlib-only, no third-party dependencies
+license = {file = "LICENSE"}
 
 [project.optional-dependencies]
 examples = ["langchain", "langchain-community", "requests"]
